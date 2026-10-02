@@ -396,13 +396,19 @@ class AIEnhancementService: ObservableObject {
     ) async throws -> AIEnhancementResult {
         let startTime = Date()
         let promptName = configuration.prompt?.title
+        // When VoiceInk Refine is downloaded, a failed provider falls back to it at once
+        // instead of retrying, so a slow or offline cloud model never stalls dictation.
+        let canFallBackLocally =
+            configuration.provider != nil
+            && configuration.provider != .voiceInkRefine
+            && aiService.voiceInkRefineService.isAvailableInModes
 
         do {
             let requestResult = try await makeRequestWithRetry(
                 text: text,
                 configuration: configuration,
                 contextSnapshot: contextSnapshot,
-                maxAttempts: EnhancementRequestSettings.maximumAttempts
+                maxAttempts: canFallBackLocally ? 1 : EnhancementRequestSettings.maximumAttempts
             )
             let endTime = Date()
             let duration = endTime.timeIntervalSince(startTime)
@@ -421,7 +427,40 @@ class AIEnhancementService: ObservableObject {
             logger.error(
                 "Enhancement failed provider=\(providerName, privacy: .public) model=\(modelName, privacy: .public) duration=\(duration, format: .fixed(precision: 3), privacy: .public)s: \(errorDescription, privacy: .public)"
             )
+            if canFallBackLocally, !(error is CancellationError) {
+                if let fallbackResult = try await enhanceWithLocalFallback(text, startTime: startTime) {
+                    return fallbackResult
+                }
+            }
             throw error
+        }
+    }
+
+    private func enhanceWithLocalFallback(_ text: String, startTime: Date) async throws -> AIEnhancementResult? {
+        do {
+            let result = try await aiService.enhanceWithVoiceInkRefine(transcript: text)
+            let filteredResult = AIEnhancementOutputFilter.filter(
+                result.trimmingCharacters(in: .whitespacesAndNewlines)
+            )
+            guard !filteredResult.isEmpty else { return nil }
+            let duration = Date().timeIntervalSince(startTime)
+            logger.notice(
+                "Enhancement fell back to \(VoiceInkRefineService.providerName, privacy: .public) duration=\(duration, format: .fixed(precision: 3), privacy: .public)s"
+            )
+            return AIEnhancementResult(
+                text: filteredResult,
+                duration: duration,
+                promptName: VoiceInkRefineService.providerName,
+                systemMessage: nil,
+                userMessage: text
+            )
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            logger.error(
+                "Local fallback failed: \(error.localizedDescription, privacy: .public)"
+            )
+            return nil
         }
     }
 
